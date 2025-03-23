@@ -1,125 +1,131 @@
 # Import all of the dependencies
 import streamlit as st
-import os
-import imageio
-import tensorflow as tf
-
-from utils import load_data, num_to_char
-from modelutil import load_model
-
-# New imports for live webcam
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
-import av
+import os 
+import imageio 
 import cv2
 import numpy as np
+import tensorflow as tf 
 
-# Set the layout to the streamlit app as wide
+from utils import num_to_char
+from modelutil import load_model
+from collections import deque
+
+# Set the layout to the streamlit app as wide 
 st.set_page_config(layout='wide')
 
 # Setup the sidebar
-with st.sidebar:
+with st.sidebar: 
     st.image('https://www.onepointltd.com/wp-content/uploads/2020/03/inno2.png')
     st.title('LipTranscribe')
     st.info('This application is originally developed from the LipNet deep learning model.')
+    
+    # Button to activate live webcam lipreading
+    use_webcam = st.checkbox('Use Live Webcam')
 
-# Title
 st.title('LipReading Web-app')
 
-# ----------------------------
-# Section 1: Pre-recorded video demo (your existing code)
-# ----------------------------
+# ========== If user selects Webcam ==========
+if use_webcam:
+    st.header('Live Webcam LipReading with Sliding Window')
+    
+    # Load your trained model
+    model = load_model()
 
-st.header(" Try with Sample Videos")
-# Generate a list of options or videos
-options = os.listdir(os.path.join('..', 'data', 's1'))
-selected_video = st.selectbox('Choose video', options)
+    # Open webcam
+    cap = cv2.VideoCapture(0)
 
-# Generate two columns
-col1, col2 = st.columns(2)
+    if not cap.isOpened():
+        st.error("Could not open webcam.")
+    else:
+        # Create Streamlit placeholders
+        frame_placeholder = st.empty()
+        prediction_placeholder = st.empty()
 
-if options:
-    # Rendering the video
-    with col1:
-        st.info('The video below displays the converted video in mp4 format')
-        file_path = os.path.join('..', 'data', 's1', selected_video)
-        os.system(f'ffmpeg -i {file_path} -vcodec libx264 test_video.mp4 -y')
+        st.info("Press STOP in the toolbar to exit live webcam lipreading.")
+        
+        # Define a sliding window / buffer for frames
+        frame_buffer = deque(maxlen=75)  # 75 frames expected by model
 
-        # Rendering inside of the app
-        video = open('test_video.mp4', 'rb')
-        video_bytes = video.read()
-        st.video(video_bytes)
+        # Streamlit loop
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                st.warning("Failed to grab frame.")
+                break
 
-    with col2:
-        st.info('This is all the machine learning model sees when making a prediction')
-        video, annotations = load_data(tf.convert_to_tensor(file_path))
-        imageio.mimsave('animation.gif', video, fps=10)
-        st.image('animation.gif', width=400)
+            # Preprocess frame
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            cropped_frame = gray_frame[190:236, 80:220]  # Crop lip region
 
-        st.info('This is the output of the machine learning model as tokens')
-        model = load_model()
-        yhat = model.predict(tf.expand_dims(video, axis=0))
-        decoder = tf.keras.backend.ctc_decode(yhat, [75], greedy=True)[0][0].numpy()
-        st.text(decoder)
+            # Normalize the frame
+            input_frame = cropped_frame.astype(np.float32)
+            mean = np.mean(input_frame)
+            std = np.std(input_frame)
+            normalized_frame = (input_frame - mean) / (std + 1e-10)
 
-        # Convert prediction to text
-        st.info('Decode the raw tokens into words')
-        converted_prediction = tf.strings.reduce_join(num_to_char(decoder)).numpy().decode('utf-8')
-        st.text(converted_prediction)
+            # Add a channel dimension (H, W, 1)
+            normalized_frame = np.expand_dims(normalized_frame, axis=-1)
 
-# ----------------------------
-# Section 2: Live Webcam Lip Reading (NEW)
-# ----------------------------
+            # Append to sliding window buffer
+            frame_buffer.append(normalized_frame)
 
-st.header("🎥 Live Webcam Lip Reading")
+            # Display live webcam feed
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_placeholder.image(frame_bgr, channels='RGB', caption='Webcam Feed')
 
-# Load your model once (reuse it in the video processor)
-live_model = load_model()
+            # If we have 75 frames, make prediction
+            if len(frame_buffer) == 75:
+                # Convert buffer to numpy array and add batch dim
+                input_frames = np.array(frame_buffer)
+                input_frames = np.expand_dims(input_frames, axis=0)  # Shape: (1, 75, 46, 140, 1)
 
-# Output box for displaying transcription
-output_text = st.empty()
+                # Predict
+                yhat = model.predict(input_frames)
+                decoder = tf.keras.backend.ctc_decode(yhat, [75], greedy=True)[0][0].numpy()
 
-# Define the live video processor class
-class LiveLipReader(VideoProcessorBase):
-    def __init__(self):
-        self.frames_buffer = []
-        self.frame_count = 75  # Expected sequence length for LipNet
-        self.model = live_model
+                # Convert prediction to text
+                converted_prediction = tf.strings.reduce_join(num_to_char(decoder)).numpy().decode('utf-8')
 
-    def recv(self, frame):
-        img = frame.to_ndarray(format="bgr24")
+                # Display prediction
+                prediction_placeholder.subheader(f'Prediction: {converted_prediction}')
 
-        # Here you need your face + mouth detection logic
-        # For simplicity, we'll resize the full frame as a placeholder
-        # Replace this with your `extract_mouth_region()` method
-        processed_frame = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), (100, 50)) / 255.0
+        cap.release()
 
-        self.frames_buffer.append(processed_frame)
+# ========== If user selects pre-recorded video ==========
+else:
+    # Generating a list of options or videos 
+    options = os.listdir(os.path.join('..', 'data', 's1'))
+    selected_video = st.selectbox('Choose video', options)
 
-        # If we have enough frames, make a prediction
-        if len(self.frames_buffer) == self.frame_count:
-            # Convert to numpy array and expand dims
-            sequence = np.array(self.frames_buffer)
-            sequence = np.expand_dims(sequence, axis=-1)  # Add channel dim for grayscale
-            sequence = np.expand_dims(sequence, axis=0)   # Batch dimension
+    # Generate two columns 
+    col1, col2 = st.columns(2)
 
-            # Model prediction
-            yhat = self.model.predict(sequence)
-            decoder = tf.keras.backend.ctc_decode(yhat, [self.frame_count], greedy=True)[0][0].numpy()
-            prediction_text = tf.strings.reduce_join(num_to_char(decoder)).numpy().decode('utf-8')
+    if options: 
+        # Rendering the video 
+        with col1: 
+            st.info('The video below displays the converted video in mp4 format')
+            file_path = os.path.join('..','data','s1', selected_video)
+            os.system(f'ffmpeg -i {file_path} -vcodec libx264 test_video.mp4 -y')
 
-            # Display prediction
-            output_text.markdown(f"### 📝 Predicted Text: `{prediction_text}`")
+            # Rendering inside of the app
+            video = open('test_video.mp4', 'rb') 
+            video_bytes = video.read() 
+            st.video(video_bytes)
 
-            # Reset the buffer
-            self.frames_buffer.clear()
+        with col2: 
+            st.info('This is all the machine learning model sees when making a prediction')
+            from utils import load_data  # Moved import to avoid conflict above
+            video, annotations = load_data(tf.convert_to_tensor(file_path))
+            imageio.mimsave('animation.gif', video, fps=10)
+            st.image('animation.gif', width=400) 
 
-        # Return the current video frame to display
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
+            st.info('This is the output of the machine learning model as tokens')
+            model = load_model()
+            yhat = model.predict(tf.expand_dims(video, axis=0))
+            decoder = tf.keras.backend.ctc_decode(yhat, [75], greedy=True)[0][0].numpy()
+            st.text(decoder)
 
-# Start the webcam streamer
-webrtc_streamer(
-    key="live-lip-reader",
-    video_processor_factory=LiveLipReader,
-    rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-)
-
+            # Convert prediction to text
+            st.info('Decode the raw tokens into words')
+            converted_prediction = tf.strings.reduce_join(num_to_char(decoder)).numpy().decode('utf-8')
+            st.text(converted_prediction)
